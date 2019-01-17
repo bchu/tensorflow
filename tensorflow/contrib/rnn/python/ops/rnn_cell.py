@@ -2494,15 +2494,19 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
   The class uses optional peep-hole connections, optional cell clipping, and
   an optional projection layer.
 
-  Layer normalization implementation is based on:
+  Layer normalization implementation is a modification of:
 
     https://arxiv.org/abs/1607.06450.
 
   "Layer Normalization"
   Jimmy Lei Ba, Jamie Ryan Kiros, Geoffrey E. Hinton
 
-  and is applied before the internal nonlinearities.
-
+  and is applied separately to each column of the linear transformation of the
+  inputs and recurrent states. That is, each LSTM gate preactivation, cell
+  update preactivation, and hidden update preactivation is normalized
+  separately. This differs from the implementation of layer norm for LSTMs in
+  the paper. Use `LayerNormLSTMCellV2` for an implementation that matches the
+  paper.
   """
 
   def __init__(self,
@@ -2514,8 +2518,7 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
                proj_clip=None,
                forget_bias=1.0,
                activation=None,
-               layer_norm=True,
-               layer_norm_columns=True,
+               layer_norm=False,
                norm_gain=1.0,
                norm_shift=0.0,
                reuse=None):
@@ -2539,12 +2542,6 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
         CudnnLSTM trained checkpoints.
       activation: Activation function of the inner states.  Default: `tanh`.
       layer_norm: If `True`, layer normalization will be applied.
-      layer_norm_columns: If `True`, layer normalization will be applied
-        separately to columns of the linear transformation of the inputs and
-        recurrent states. If `False`, normalization will be applied as
-        described in the paper "Layer Normalization" by Ba et. al.
-        `False` is the recommended setting. `True` is the default for backwards
-        compatibility. If `layer_norm` is `False`, this argument is ignored.
       norm_gain: float, The layer normalization gain initial value. If
         `layer_norm` has been set to `False`, this argument will be ignored.
       norm_shift: float, The layer normalization shift initial value. If
@@ -2567,7 +2564,6 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
     self._forget_bias = forget_bias
     self._activation = activation or math_ops.tanh
     self._layer_norm = layer_norm
-    self._layer_norm_columns = layer_norm_columns
     self._norm_gain = norm_gain
     self._norm_shift = norm_shift
 
@@ -2591,7 +2587,8 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
               output_size,
               bias,
               bias_initializer=None,
-              kernel_initializer=None):
+              kernel_initializer=None,
+              layer_norm=False):
     """Linear map: sum_i(args[i] * W[i]), where W[i] is a Variable.
 
     Args:
@@ -2601,12 +2598,12 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
       bias_initializer: starting value to initialize the bias
         (default is all zeros).
       kernel_initializer: starting value to initialize the weight.
+      layer_norm: boolean, whether to apply layer normalization.
+
 
     Returns:
       A 2D Tensor with shape [batch x output_size] taking value
-      sum_i(args[i] * W[i]), where each W[i] is a newly created Variable,
-      and where args[i] * W[i] will be layer normalized if `layer_norm_columns`
-      is False.
+      sum_i(args[i] * W[i]), where each W[i] is a newly created Variable.
 
     Raises:
       ValueError: if some of the arguments has unspecified or wrong shape.
@@ -2633,21 +2630,15 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
     # Now the computation.
     scope = vs.get_variable_scope()
     with vs.variable_scope(scope) as outer_scope:
-      kernel = vs.get_variable(
+      weights = vs.get_variable(
           "kernel", [total_arg_size, output_size],
           dtype=dtype,
           initializer=kernel_initializer)
-      if self._layer_norm and not self._layer_norm_columns:
-        axis_sizes = [shape[1].value for shape in shapes]
-        weights = array_ops.split(kernel, axis_sizes)
-        res = [math_ops.matmul(arg, w) for arg, w in zip(args, weights)]
-        # Don't add layer norm offset because we add a bias.
-        res = [_norm(self._norm_gain, self._norm_shift, out,
-                     str(i), center=False) for i, out in enumerate(res)]
-        res = sum(res)
+      if len(args) == 1:
+        res = math_ops.matmul(args[0], weights)
       else:
-        res = math_ops.matmul(array_ops.concat(args, 1), kernel)
-      if not bias or (self._layer_norm and self._layer_norm_columns):
+        res = math_ops.matmul(array_ops.concat(args, 1), weights)
+      if not bias:
         return res
       with vs.variable_scope(outer_scope) as inner_scope:
         inner_scope.set_partitioner(None)
@@ -2656,7 +2647,8 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
         biases = vs.get_variable(
             "bias", [output_size], dtype=dtype, initializer=bias_initializer)
 
-    res = nn_ops.bias_add(res, biases)
+    if not layer_norm:
+      res = nn_ops.bias_add(res, biases)
 
     return res
 
@@ -2700,11 +2692,12 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
           [inputs, m_prev],
           4 * self._num_units,
           bias=True,
-          bias_initializer=None)
+          bias_initializer=None,
+          layer_norm=self._layer_norm)
       i, j, f, o = array_ops.split(
           value=lstm_matrix, num_or_size_splits=4, axis=1)
 
-      if self._layer_norm and self._layer_norm_columns:
+      if self._layer_norm:
         i = _norm(self._norm_gain, self._norm_shift, i, "input")
         j = _norm(self._norm_gain, self._norm_shift, j, "transform")
         f = _norm(self._norm_gain, self._norm_shift, f, "forget")
@@ -2749,6 +2742,236 @@ class LayerNormLSTMCell(rnn_cell_impl.RNNCell):
           # pylint: disable=invalid-unary-operand-type
           m = clip_ops.clip_by_value(m, -self._proj_clip, self._proj_clip)
           # pylint: enable=invalid-unary-operand-type
+
+    new_state = (rnn_cell_impl.LSTMStateTuple(c, m))
+    return m, new_state
+
+class LayerNormLSTMCellV2(rnn_cell_impl.LayerRNNCell):
+  """Long short-term memory unit (LSTM) recurrent network cell.
+
+  The default non-peephole implementation is based on:
+
+    http://www.bioinf.jku.at/publications/older/2604.pdf
+
+  S. Hochreiter and J. Schmidhuber.
+  "Long Short-Term Memory". Neural Computation, 9(8):1735-1780, 1997.
+
+  The peephole implementation is based on:
+
+    https://research.google.com/pubs/archive/43905.pdf
+
+  Hasim Sak, Andrew Senior, and Francoise Beaufays.
+  "Long short-term memory recurrent neural network architectures for
+   large scale acoustic modeling." INTERSPEECH, 2014.
+
+  The class uses optional peep-hole connections, optional cell clipping, and
+  an optional projection layer.
+
+  Layer normalization implementation is based on equations (20)-(22) in:
+
+    https://arxiv.org/abs/1607.06450.
+
+  "Layer Normalization"
+  Jimmy Lei Ba, Jamie Ryan Kiros, Geoffrey E. Hinton.
+
+  That is, layer normalization is applied separately to the linear
+  transformation of the inputs, the linear transformation of the recurrent
+  hidden state, and the hidden update preactivation.
+  """
+
+  def __init__(self,
+               num_units,
+               use_peepholes=False,
+               cell_clip=None,
+               initializer=None,
+               num_proj=None,
+               proj_clip=None,
+               forget_bias=1.0,
+               activation=None,
+               norm_gain=1.0,
+               norm_shift=0.0,
+               reuse=None):
+    """Initialize the parameters for an LSTM cell.
+
+    Args:
+      num_units: int, The number of units in the LSTM cell
+      use_peepholes: bool, set True to enable diagonal/peephole connections.
+      cell_clip: (optional) A float value, if provided the cell state is clipped
+        by this value prior to the cell output activation.
+      initializer: (optional) The initializer to use for the weight and
+        projection matrices.
+      num_proj: (optional) int, The output dimensionality for the projection
+        matrices.  If None, no projection is performed.
+      proj_clip: (optional) A float value.  If `num_proj > 0` and `proj_clip` is
+        provided, then the projected values are clipped elementwise to within
+        `[-proj_clip, proj_clip]`.
+      forget_bias: Biases of the forget gate are initialized by default to 1
+        in order to reduce the scale of forgetting at the beginning of
+        the training. Must set it manually to `0.0` when restoring from
+        CudnnLSTM trained checkpoints.
+      activation: Activation function of the inner states.  Default: `tanh`.
+      norm_gain: float, The layer normalization gain initial value.
+      norm_shift: float, The layer normalization shift initial value.
+      reuse: (optional) Python boolean describing whether to reuse variables
+        in an existing scope.  If not `True`, and the existing scope already has
+        the given variables, an error is raised.
+
+      When restoring from CudnnLSTM-trained checkpoints, must use
+      CudnnCompatibleLSTMCell instead.
+    """
+    super(LayerNormLSTMCell, self).__init__(_reuse=reuse)
+
+    # Inputs must be 2-dimensional.
+    self.input_spec = base_layer.InputSpec(ndim=2)
+
+    self._num_units = num_units
+    self._use_peepholes = use_peepholes
+    self._cell_clip = cell_clip
+    self._initializer = initializer
+    self._num_proj = num_proj
+    self._proj_clip = proj_clip
+    self._forget_bias = forget_bias
+    self._activation = activation or math_ops.tanh
+    self._norm_gain = norm_gain
+    self._norm_shift = norm_shift
+
+    if num_proj:
+      self._state_size = (rnn_cell_impl.LSTMStateTuple(num_units, num_proj))
+      self._output_size = num_proj
+    else:
+      self._state_size = (rnn_cell_impl.LSTMStateTuple(num_units, num_units))
+      self._output_size = num_units
+
+  @property
+  def state_size(self):
+    return self._state_size
+
+  @property
+  def output_size(self):
+    return self._output_size
+
+  def build(self, inputs_shape):
+    if inputs_shape[-1] is None:
+      raise ValueError("Expected inputs.shape[-1] to be known, saw shape: %s"
+                       % inputs_shape)
+
+    input_depth = inputs_shape[-1]
+    h_depth = self._num_units if self._num_proj is None else self._num_proj
+
+    self._kernel = self.add_variable(
+        rnn_cell_impl._WEIGHTS_VARIABLE_NAME,
+        shape=[input_depth + h_depth, 4 * self._num_units],
+        initializer=self._initializer)
+    self._bias = self.add_variable(
+        rnn_cell_impl._BIAS_VARIABLE_NAME,
+        shape=[4 * self._num_units],
+        initializer=init_ops.zeros_initializer(dtype=self.dtype))
+
+    gamma_init = init_ops.constant_initializer(self._norm_gain)
+    beta_init = init_ops.constant_initializer(self._norm_shift)
+    with vs.variable_scope(self._scope):
+      with vs.variable_scope('input'):
+        vs.get_variable('gamma', shape=[4 * self._num_units],
+                        initializer=gamma_init)
+      with vs.variable_scope('hidden'):
+        vs.get_variable('gamma', shape=[4 * self._num_units],
+                        initializer=gamma_init)
+      with vs.variable_scope('cell_update'):
+        vs.get_variable('gamma', shape=[self._num_units],
+                        initializer=gamma_init)
+        vs.get_variable('beta', shape=[self._num_units],
+                        initializer=beta_init)
+
+    if self._use_peepholes:
+      self._w_f_diag = self.add_variable("w_f_diag", shape=[self._num_units],
+                                         initializer=self._initializer)
+      self._w_i_diag = self.add_variable("w_i_diag", shape=[self._num_units],
+                                         initializer=self._initializer)
+      self._w_o_diag = self.add_variable("w_o_diag", shape=[self._num_units],
+                                         initializer=self._initializer)
+
+    if self._num_proj is not None:
+      self._proj_kernel = self.add_variable(
+          "projection/%s" % rnn_cell_impl._WEIGHTS_VARIABLE_NAME,
+          shape=[self._num_units, self._num_proj],
+          initializer=self._initializer)
+
+    self.built = True
+
+  def call(self, inputs, state):
+    """Run one step of LSTM.
+
+    Args:
+      inputs: input Tensor, 2D, `[batch, num_units].
+      state: this must be a tuple of state Tensors, both `2-D`,
+        with column sizes `c_state` and `m_state`.
+
+    Returns:
+      A tuple containing:
+
+      - A `2-D, [batch x output_dim]`, Tensor representing the output of the
+        LSTM after reading `inputs` when previous state was `state`.
+        Here output_dim is:
+           num_proj if num_proj was set,
+           num_units otherwise.
+      - Tensor(s) representing the new state of LSTM after reading `inputs` when
+        the previous state was `state`.  Same type and shape(s) as `state`.
+
+    Raises:
+      ValueError: If input size cannot be inferred from inputs via
+        static shape inference.
+    """
+    sigmoid = math_ops.sigmoid
+
+    (c_prev, h_prev) = state
+
+    input_size = inputs.get_shape().with_rank(2)[1]
+    if input_size.value is None:
+      raise ValueError("Could not infer input size from inputs.get_shape()[-1]")
+
+    h_depth = self._num_units if self._num_proj is None else self._num_proj
+
+    input_transformed = math_ops.matmul(inputs, self._kernel[:input_size])
+    h_prev_transformed = math_ops.matmul(inputs, self._kernel[h_depth:])
+    # Don't use layer norm offset (center=False), because we add a bias.
+    with vs.variable_scope(self._scope):
+      input_normalized = _norm(self._norm_gain, self._norm_shift,
+                               input_transformed, 'input', center=False)
+      h_prev_normalized = _norm(self._norm_gain, self._norm_shift,
+                                h_prev_transformed, 'hidden', center=False)
+    lstm_matrix = input_normalized + h_prev_normalized
+    lstm_matrix = nn_ops.bias_add(lstm_matrix, self._bias)
+
+    # i = input_gate, j = new_input, f = forget_gate, o = output_gate
+    i, j, f, o = array_ops.split(
+        value=lstm_matrix, num_or_size_splits=4, axis=1)
+    # Diagonal connections
+    if self._use_peepholes:
+      c = (sigmoid(f + self._forget_bias + self._w_f_diag * c_prev) * c_prev +
+           sigmoid(i + self._w_i_diag * c_prev) * self._activation(j))
+    else:
+      c = (sigmoid(f + self._forget_bias) * c_prev + sigmoid(i) *
+           self._activation(j))
+
+    with vs.variable_scope(self._scope):
+      c = _norm(self._norm_gain, self._norm_shift, c, "cell_update")
+
+    if self._cell_clip is not None:
+      # pylint: disable=invalid-unary-operand-type
+      c = clip_ops.clip_by_value(c, -self._cell_clip, self._cell_clip)
+      # pylint: enable=invalid-unary-operand-type
+    if self._use_peepholes:
+      m = sigmoid(o + self._w_o_diag * c) * self._activation(c)
+    else:
+      m = sigmoid(o) * self._activation(c)
+
+    if self._num_proj is not None:
+      m = math_ops.matmul(m, self._proj_kernel)
+
+      if self._proj_clip is not None:
+        # pylint: disable=invalid-unary-operand-type
+        m = clip_ops.clip_by_value(m, -self._proj_clip, self._proj_clip)
+        # pylint: enable=invalid-unary-operand-type
 
     new_state = (rnn_cell_impl.LSTMStateTuple(c, m))
     return m, new_state
